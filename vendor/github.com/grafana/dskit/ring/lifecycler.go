@@ -110,8 +110,9 @@ type Lifecycler struct {
 	Zone     string
 
 	// Whether to flush if transfer fails on shutdown.
-	flushOnShutdown      *atomic.Bool
-	unregisterOnShutdown *atomic.Bool
+	flushOnShutdown       *atomic.Bool
+	unregisterOnShutdown  *atomic.Bool
+	clearTokensOnShutdown *atomic.Bool
 
 	// We need to remember the ingester state, tokens and registered timestamp just in case the KV store
 	// goes away and comes back empty. The state changes during lifecycle of instance.
@@ -160,23 +161,22 @@ func NewLifecycler(cfg LifecyclerConfig, flushTransferer FlushTransferer, ringNa
 	}
 
 	l := &Lifecycler{
-		cfg:                  cfg,
-		flushTransferer:      flushTransferer,
-		KVStore:              store,
-		Addr:                 fmt.Sprintf("%s:%d", addr, port),
-		ID:                   cfg.ID,
-		RingName:             ringName,
-		RingKey:              ringKey,
-		flushOnShutdown:      atomic.NewBool(flushOnShutdown),
-		unregisterOnShutdown: atomic.NewBool(cfg.UnregisterOnShutdown),
-		Zone:                 cfg.Zone,
-		actorChan:            make(chan func()),
-		state:                PENDING,
-		lifecyclerMetrics:    NewLifecyclerMetrics(ringName, reg),
-		logger:               logger,
+		cfg:                   cfg,
+		flushTransferer:       flushTransferer,
+		KVStore:               store,
+		Addr:                  fmt.Sprintf("%s:%d", addr, port),
+		ID:                    cfg.ID,
+		RingName:              ringName,
+		RingKey:               ringKey,
+		flushOnShutdown:       atomic.NewBool(flushOnShutdown),
+		unregisterOnShutdown:  atomic.NewBool(cfg.UnregisterOnShutdown),
+		clearTokensOnShutdown: atomic.NewBool(false),
+		Zone:                  cfg.Zone,
+		actorChan:             make(chan func()),
+		state:                 PENDING,
+		lifecyclerMetrics:     NewLifecyclerMetrics(ringName, reg),
+		logger:                logger,
 	}
-
-	l.lifecyclerMetrics.tokensToOwn.Set(float64(cfg.NumTokens))
 
 	l.BasicService = services.
 		NewBasicService(nil, l.loop, l.stopping).
@@ -304,8 +304,6 @@ func (i *Lifecycler) getTokens() Tokens {
 }
 
 func (i *Lifecycler) setTokens(tokens Tokens) {
-	i.lifecyclerMetrics.tokensOwned.Set(float64(len(tokens)))
-
 	i.stateMtx.Lock()
 	defer i.stateMtx.Unlock()
 
@@ -517,6 +515,13 @@ heartbeatLoop:
 			return perrors.Wrapf(err, "failed to unregister from the KV store, ring: %s", i.RingName)
 		}
 		level.Info(i.logger).Log("msg", "instance removed from the KV store", "ring", i.RingName)
+	}
+
+	if i.cfg.TokensFilePath != "" && i.ClearTokensOnShutdown() {
+		if err := os.Remove(i.cfg.TokensFilePath); err != nil {
+			return perrors.Wrapf(err, "failed to delete tokens file %s", i.cfg.TokensFilePath)
+		}
+		level.Info(i.logger).Log("msg", "removed tokens file from disk", "filename", i.cfg.TokensFilePath)
 	}
 
 	return nil
@@ -738,9 +743,13 @@ func (i *Lifecycler) updateConsul(ctx context.Context) error {
 		}
 
 		instanceDesc, ok := ringDesc.Ingesters[i.ID]
+
 		if !ok {
-			// consul must have restarted
-			level.Info(i.logger).Log("msg", "found empty ring, inserting tokens", "ring", i.RingName)
+			// If the instance is missing in the ring, we need to add it back. However, due to how shuffle sharding work,
+			// the missing instance for some period of time could have cause a resharding of tenants among instances:
+			// to guarantee query correctness we need to update the registration timestamp to current time.
+			level.Info(i.logger).Log("msg", "instance is missing in the ring (e.g. the ring backend storage has been reset), registering the instance with an updated registration timestamp", "ring", i.RingName)
+			i.setRegisteredAt(time.Now())
 			ringDesc.AddIngester(i.ID, i.Addr, i.Zone, i.getTokens(), i.GetState(), i.getRegisteredAt())
 		} else {
 			instanceDesc.Timestamp = time.Now().Unix()
@@ -825,8 +834,20 @@ func (i *Lifecycler) SetUnregisterOnShutdown(enabled bool) {
 	i.unregisterOnShutdown.Store(enabled)
 }
 
+// ClearTokensOnShutdown returns if persisted tokens should be cleared on shutdown.
+func (i *Lifecycler) ClearTokensOnShutdown() bool {
+	return i.clearTokensOnShutdown.Load()
+}
+
+// SetClearTokensOnShutdown enables/disables deletions of tokens on shutdown.
+// Set to `true` in case one wants to clear tokens on shutdown which are
+// otherwise persisted, e.g. useful in custom shutdown handlers.
+func (i *Lifecycler) SetClearTokensOnShutdown(enabled bool) {
+	i.clearTokensOnShutdown.Store(enabled)
+}
+
 func (i *Lifecycler) processShutdown(ctx context.Context) {
-	flushRequired := i.flushOnShutdown.Load()
+	flushRequired := i.FlushOnShutdown()
 	transferStart := time.Now()
 	if err := i.flushTransferer.TransferOut(ctx); err != nil {
 		if err == ErrTransferDisabled {
