@@ -7,6 +7,7 @@ provided by the Grafana Loki SIG operator.
 
 ### Hacking on Loki Operator on kind or OpenShift
 
+* See the developer overview in [AGENTS.md](AGENTS.md)
 * If you want to contribute to this repository, you might need a step-by-step guide on how to start [hacking on Loki-operator with kind](https://github.com/grafana/loki/blob/main/operator/docs/operator/hack_loki_operator.md#hacking-using-kind).
 * Also, there is a step-by-step guide on how to test Loki-operator on [OpenShift](https://github.com/grafana/loki/blob/main/operator/docs/operator/hack_loki_operator.md#hacking-on-openshift).
 * There is also a [basic troubleshooting guide](https://github.com/grafana/loki/blob/main/operator/docs/operator/hack_loki_operator.md#basic-troubleshooting) if you run into some common problems.
